@@ -194,7 +194,7 @@ OmniRoute uses **SQLite** (via `better-sqlite3`) for all persistence. These vari
 | `OMNIROUTE_CHAT_HEAVY_MESSAGE_COUNT`    | `200`                   | `src/shared/middleware/chatBodyAdmission.ts`     | Message count that classifies a chat request as heavyweight even when its body is below the byte threshold.                                                                                                                                                                                                                                                        |
 | `OMNIROUTE_CHAT_HEAVY_TOOL_COUNT`       | `64`                    | `src/shared/middleware/chatBodyAdmission.ts`     | Tool count that classifies a chat request as heavyweight even when its body is below the byte threshold.                                                                                                                                                                                                                                                           |
 | `OMNIROUTE_CHAT_HEAVY_ESTIMATED_TOKENS` | `32000`                 | `src/shared/middleware/chatBodyAdmission.ts`     | Conservative string-size token estimate that classifies a request as heavyweight; this is an admission-cost proxy, not provider billing tokenization.                                                                                                                                                                                                              |
-| `OMNIROUTE_CHAT_HARD_MAX_MESSAGES`      | `800`                   | `src/shared/middleware/chatBodyAdmission.ts`     | Hard chat history cap. Requests above it receive structured compact-required `413` before compression, translation, or provider dispatch.                                                                                                                                                                                                                           |
+| `OMNIROUTE_CHAT_HARD_MAX_MESSAGES`      | `0` (disabled)          | `src/shared/middleware/chatBodyAdmission.ts`     | Optional opt-in chat history cap. Disabled by default: a message count is deployment policy, not a universal property of a request, and capping here rejects conversations with a terminal `413` before the compression pipeline can make them servable. Heap growth is bounded by `OMNIROUTE_CHAT_MAX_HEAVY_IN_FLIGHT` and the heap-pressure shed. Set a positive value on memory-constrained deployments that need a hard ceiling; excess then receives structured compact-required `413`. |
 | `OMNIROUTE_MAX_NONSTREAMING_RESPONSE_BYTES` | `67108864` (64 MB)  | `open-sse/handlers/chatCore/nonStreamingResponseBody.ts` | Hard cap for a non-streaming upstream response buffered fully into memory. Past this the upstream reader is cancelled and the request fails fast instead of growing an unbounded string until the heap is exhausted.                                                                                                                                                 |
 | `OMNIROUTE_FORWARDING_HEADER_BUDGET_BYTES` | `768`                   | `open-sse/handlers/chatCore/responseHeaders.ts` | Max wire bytes forwarded from upstream response headers. When the budget is exceeded, lower-priority headers (e.g., custom `x-codex-*`, `x-oai-request-id`) are dropped to stay within common reverse-proxy header limits. Set higher to forward more upstream metadata at the cost of larger response header size.                                             |
 | `CORS_ORIGIN`                           | _(unset)_               | `src/server/cors/origins.ts`                    | Legacy single-origin CORS allowlist. Prefer `CORS_ALLOWED_ORIGINS` for new deployments. CORS is only for cross-origin browser API clients; authenticated dashboard writes use same-origin requests plus session-bound CSRF protection instead.                                                                                                                     |
@@ -736,12 +736,12 @@ The logging system writes to both stdout and rotated log files. All configuratio
 | `CALL_LOGS_TABLE_MAX_ROWS`                | `100000`                   | Max rows in the `call_logs` SQLite table before pruning.                          |
 | `ENABLE_REQUEST_LOGS`                     | _(unset)_                  | Force detailed request logging on or off, overriding the dashboard setting.       |
 | `MAX_PENDING_REQUEST_AGE_MS`              | `3600000` (1 hour)         | Max age for orphaned active request log entries before in-memory cleanup.         |
-| `CALL_LOG_PIPELINE_CAPTURE_STREAM_CHUNKS` | `true`                     | Store stream chunks in pipeline artifacts when `call_log_pipeline_enabled=true`.  |
+| `CALL_LOG_PIPELINE_CAPTURE_STREAM_CHUNKS` | `false`                    | Store stream chunks in pipeline artifacts when `call_log_pipeline_enabled=true`. Opt-in (`true`) — off by default to save disk. |
 | `CALL_LOG_PIPELINE_MAX_SIZE_KB`           | `512`                      | Max pipeline call log artifact size in KB when `call_log_pipeline_enabled=true`.  |
 | `PROXY_LOGS_TABLE_MAX_ROWS`               | `100000`                   | Max rows in the `proxy_logs` SQLite table before pruning.                         |
 | `APP_LOG_ROTATION_CHECK_INTERVAL_MS`      | `60000` (1 min)            | How often `src/lib/logRotation.ts` re-checks the active log file size.            |
 | `CHAT_LOG_TEXT_LIMIT`                     | `65536`                    | Max string length retained in chat log artifacts (default 64 KB).                 |
-| `CHAT_LOG_ARRAY_TAIL_ITEMS`               | `24`                       | Number of array items retained from the tail when truncating chat log payloads.   |
+| `CHAT_LOG_ARRAY_TAIL_ITEMS`               | `128`                      | Number of array items retained from the tail when truncating chat log payloads.   |
 | `CHAT_LOG_MAX_DEPTH`                      | `6`                        | Max nesting depth before chat log payloads are truncated.                         |
 | `CHAT_LOG_MAX_OBJECT_KEYS`                | `80`                       | Max object keys retained in chat log payloads (0 = unlimited).                    |
 | `CHAT_DEBUG_FILE`                         | `false`                    | When true, `serializeArtifactForStorage` skips size-based truncation. Debug only. |
@@ -853,6 +853,7 @@ Reverse-engineered session bridge for hyperagent.com (`src/shared/constants/prov
 
 | Variable                            | Default       | Source File                        | Description                                                                                                                                                                                                                                                                                            |
 | ----------------------------------- | ------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MODELS_DEV_SYNC_ENABLED`           | `false`       | `src/lib/modelsDevSync.ts`         | Opt-in switch for the models.dev capability sync. Set to anything non-empty it wins over the `modelsDevSyncEnabled` setting (Dashboard > Settings > AI) in either direction, so a deployment can pin the sync on or off without depending on database state surviving a rebuild; unset, it defers to that setting. On for `1`, `true`, `yes` or `on` in any casing; any other value is off.          |
 | `MODELS_DEV_SYNC_INTERVAL`          | `86400` (24h) | `src/lib/modelsDevSync.ts`         | Development-time model catalog sync interval in seconds.                                                                                                                                                                                                                                              |
 | `CONTEXT_WINDOW_RECONCILE_INTERVAL` | `86400` (24h) | `src/lib/contextWindowResolver.ts` | Interval (seconds) for the self-correcting context-window reconciler (5004): pins provider-declared windows from `/models` discovery as `auto:discovery` overrides when they diverge from the catalog. Set to `0` to disable. Reuses already-synced data (no new fetch); never overwrites `manual` overrides. |
 
@@ -975,7 +976,7 @@ changing them requires a code edit, not an env var:
 | `CURSOR_AGENT_CLI_VERSION`       | _(detect / pin)_    | `open-sse/utils/cursorAgentCliVersion.ts`  | Agent CLI build id (`YYYY.MM.DD-<hash>`) for `x-cursor-client-version: cli-…` on Agent Run.   |
 | `CURSOR_DATA_DIR`                | _(probed)_          | `open-sse/utils/cursorAgentCliVersion.ts`  | Override Cursor Agent CLI data dir (`…/versions/<id>`); same var the official agent uses.    |
 | `CURSOR_TOKEN`                   | _(unset)_           | `scripts/ad-hoc/cursor-tap.cjs`            | Direct Cursor bearer token used by developer tooling.                                        |
-| `OMNIROUTE_LOG_REQUEST_SHAPE`    | enabled (`!== "0"`) | `src/app/api/v1/chat/completions/route.ts` | Log content-type/length markers for large chat payloads. Set `"0"` to silence.               |
+| `OMNIROUTE_LOG_REQUEST_SHAPE`    | disabled (opt-in via `"1"`) | `src/app/api/v1/chat/completions/route.ts` | Log content-type/length markers for large chat payloads when `"1"` is set. Off by default to reduce log noise. |
 | `DEBUG_RESPONSES_SSE_TO_JSON`    | _(unset)_           | `open-sse/handlers/responseTranslator.ts`  | Set `true` to log Responses API SSE→JSON translation details.                                |
 | `NEXT_PUBLIC_OMNIROUTE_E2E_MODE` | _(unset)_           | E2E test harness                           | Set `true` to enable E2E test mode (relaxed auth, test hooks).                               |
 
@@ -1206,6 +1207,17 @@ Provider quota endpoints, network tunnels (Tailscale, Ngrok, MITM debug proxy), 
 | `OMNIROUTE_ROTATE_400_THRESHOLD`            | `1`                                                                         | `open-sse/services/rotationConfig.ts`                                     | Number of `400` errors within `OMNIROUTE_ROTATE_400_WINDOW_SECONDS` required before the account is rotated (only consulted when `OMNIROUTE_ROTATE_ON_400=true`).                                                                                                                                                                                                     |
 | `OMNIROUTE_ROTATE_400_WINDOW_SECONDS`       | `120`                                                                       | `open-sse/services/rotationConfig.ts`                                     | Sliding window (seconds) over which `400` errors are counted toward `OMNIROUTE_ROTATE_400_THRESHOLD`.                                                                                                                                                                                                                                                                 |
 
+### Claude Warmup Scheduler
+
+Cron-driven warmup for opted-in Anthropic OAuth connections, so the 5-hour rate-limit window is opened by a trivial scheduled request instead of by the first real one (#8848). The scheduler is off unless `OMNIROUTE_WARMUP_ENABLED` is truthy **and** the connection is flagged in `settings.claudeWarmup.connections`; an empty connection list means nothing is warmed even with the env var on.
+
+| Variable                      | Default                                | Source File                  | Description                                                                                                                                                            |
+| ----------------------------- | -------------------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OMNIROUTE_WARMUP_ENABLED`    | _(unset → off)_                        | `src/lib/warmupScheduler.ts` | Master switch for the warmup scheduler. Accepts `1`/`true`/`yes`/`on` (case-insensitive, trimmed). Any other value, or unset, leaves the scheduler off.                 |
+| `OMNIROUTE_WARMUP_CRON`       | `0 7 * * *`                            | `src/lib/warmupScheduler.ts` | Five-field cron expression for the warmup tick, evaluated in `America/Los_Angeles` (Anthropic's reset timezone) regardless of the host clock.                           |
+| `OMNIROUTE_WARMUP_CONCURRENCY` | `3`                                    | `src/lib/warmupScheduler.ts` | How many connections are warmed in parallel per tick. Clamped to `1`-`10`; a non-numeric value falls back to `3`.                                                       |
+| `OMNIROUTE_WARMUP_MODEL`      | `claude-3-5-haiku-20241022`            | `src/lib/warmupScheduler.ts` | Model used for the warmup request. Override only if the default is unavailable on your plan; pick the cheapest model that still opens the window.                       |
+
 ### Browser-Login VNC Sessions & Data-Dir Alias
 
 Containerized Chromium+VNC used for interactive browser-login credential capture (`/api/vnc-session`), plus a legacy `DATA_DIR` alias. All optional — the VNC defaults target the bundled `omniroute-vnc-chromium:local` image and are only overridden for a custom container image, ports, or lifecycle tuning.
@@ -1275,14 +1287,17 @@ that should be able to run the docs translator.
 Optional add-on gated by the RADAR_ENABLED feature flag (default off — a feature
 flag toggled via Settings/DB, not an env var; see
 [docs/frameworks/RADAR.md](../frameworks/RADAR.md#flag-radar_enabled-default-off)).
-Both variables below are optional overrides used only to point the client at a
-self-hosted or forked feed instead of the default OmniRoute Radar feed. See
-[docs/frameworks/RADAR.md](../frameworks/RADAR.md) for the full module doc.
+The four variables below are optional overrides used only to point the client at a
+self-hosted or forked feed / supporter-key flow instead of the default OmniRoute
+Radar service. See [docs/frameworks/RADAR.md](../frameworks/RADAR.md) for the full
+module doc.
 
-| Variable            | Default                        | Source File                   | Description                                                                                     |
-| -------------------- | ------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------ |
-| `RADAR_FEED_URL`    | `https://radar.omniroute.dev`  | `src/lib/radar/sync.ts`       | Base URL of the Radar feed service. Override to point at a self-hosted or forked feed.          |
-| `RADAR_FEED_PUBKEY` | _(pinned default key)_          | `src/lib/radar/pinnedKeys.ts` | Ed25519 public key (base64-DER SPKI or PEM) used to verify feed signatures from a custom feed.   |
+| Variable                       | Default                                          | Source File                   | Description                                                                                     |
+| -------------------------------- | --------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------ |
+| `RADAR_FEED_URL`               | `https://radar.omniroute.online`                 | `src/lib/radar/sync.ts`       | Base URL of the Radar feed service. Override to point at a self-hosted or forked feed.          |
+| `RADAR_FEED_PUBKEY`            | _(pinned default key)_                           | `src/lib/radar/pinnedKeys.ts` | Ed25519 public key (base64-DER SPKI or PEM) used to verify feed signatures from a custom feed.   |
+| `RADAR_CONTRIBUTOR_CLAIM_URL`  | `https://radar.omniroute.online/auth/github`     | `src/lib/radar/links.ts`      | URL the "I'm a contributor" dashboard button opens (GitHub OAuth supporter-key claim flow).      |
+| `RADAR_SUPPORTER_PLANS_URL`    | `https://radar.omniroute.online/planos`          | `src/lib/radar/links.ts`      | URL the "Support the project" dashboard button opens (payment/plans page).                       |
 
 ---
 
@@ -1374,3 +1389,34 @@ Used by `src/lib/vncSession/manifest.ts` to configure Docker-based headless Chro
 | `REDIS_BIND_HOST` | `127.0.0.1` | Bind address for the embedded Redis service. |
 | `REDIS_PORT` | `6379` | Port for the embedded Redis service. |
 | `OMNIROUTE_REDIS_BIND_HOST` | – | OmniRoute-scoped override for the embedded Redis bind address. |
+
+---
+
+## 24. Release v3.8.50 additions
+
+These settings were introduced after the previous environment-contract snapshot.
+
+| Variable | Default | Source File | Description |
+| --- | --- | --- | --- |
+| `OMNIROUTE_CHAT_ADMISSION_QUEUE_MS` | `2000` | `src/shared/middleware/chatBodyAdmission.ts` | Maximum wait for a heavyweight chat admission slot before a retryable `503`; a short bounded wait serializes agent bursts instead of an instant `503`. `0` restores immediate rejection. |
+| `OMNIROUTE_CHAT_ADMISSION_MAX_QUEUED_BYTES` | `4194304` (4 MB) | `src/shared/middleware/chatBodyAdmission.ts` | Queued-bytes budget for the admission wait (#9654): bounds total buffered body bytes parked per lane so the wait cannot amplify the heap (#4380). Over-budget waits receive a retryable `503` immediately. |
+| `OMNIROUTE_CHAT_VIRTUAL_TTL_MS` | `60000` (60 s) | `src/shared/middleware/chatBodyAdmission.ts` | Per-connection virtual admission lanes (#9654): idle-lane eviction TTL. |
+| `OMNIROUTE_CHAT_VIRTUAL_MAX_SESSIONS` | `64` | `src/shared/middleware/chatBodyAdmission.ts` | Per-connection virtual admission lanes (#9654): max concurrent sessions (lanes). |
+| `OMNIROUTE_RUNNOW_TIMEOUT_MS` | `30000` | `src/app/api/jobs/[id]/run-now/route.ts` | Bounds how long a run-now call waits for an in-flight job before starting the queued run. |
+| `CHAT_LOG_MAX_BODY_KB` | `1024` | `src/lib/logEnv.ts` | Maximum request or response body size before log summarization, in KiB. |
+| `ADOBE_FIREFLY_BROWSER_REFRESH` | enabled | `open-sse/services/adobeFireflySession.ts` | Keeps IMS and browser-risk state fresh through account-scoped Chrome CDP sessions; set `0` to disable. |
+| `ADOBE_FIREFLY_SESSION_DISK` | enabled | `open-sse/services/adobeFireflySession.ts` | Persists repaired Adobe sessions under `DATA_DIR`; set `0` for memory-only state. |
+| `ADOBE_FIREFLY_MIN_SUBMIT_GAP_MS` | `12000` | `open-sse/services/adobeFireflySession.ts` | Minimum spacing between Adobe Firefly generate submissions. |
+| `ADOBE_FIREFLY_BATCH_EXTRA_GAP_MS` | `15000` | `open-sse/services/adobeFireflySession.ts` | Extra quiet period after every third successful Adobe submission. |
+| `ADOBE_FIREFLY_CHROME_CDP_PORT` | `9334` | `open-sse/services/adobeFireflyChromeRuntime.ts` | CDP port for the account-scoped Chrome runtime. |
+| `ADOBE_FIREFLY_CHROME_VISIBLE` | `0` | `open-sse/services/adobeFireflyChromeRuntime.ts` | Set `1` to keep the Adobe renewal browser visible; the default parks a headed window off-screen. |
+| `ADOBE_FIREFLY_CHROME_HEADLESS` | `0` | `open-sse/services/adobeFireflyChromeRuntime.ts` | Debug-only true-headless mode; Adobe colligo normally rejects the resulting risk session. |
+| `ADOBE_FIREFLY_CHROME_FORCE_RESTART` | `0` | `open-sse/services/adobeFireflyChromeRuntime.ts` | Set `1` to restart the account-scoped Chrome runtime before renewal. |
+| `ADOBE_FIREFLY_CHROME_PING` | automatic | `open-sse/services/adobeFireflyChromeRuntime.ts` | `1` forces, and `0` disables, the in-page generate probe used to prove the renewed ARP session. |
+| `ADOBE_FIREFLY_LOGIN_WAIT_MS` | context-dependent | `open-sse/services/adobeFireflyChromeRuntime.ts` | Interactive-login wait budget: `0` on background renewal and `300000` on the explicit login flow unless overridden. |
+| `ADOBE_FIREFLY_FORTER_WAIT_MS` | `45000` | `open-sse/services/adobeFireflyChromeRuntime.ts` | Maximum wait for a fresh Forter token during session renewal. |
+| `CHROME_PATH` | auto-detect | `open-sse/services/adobeFireflyChromeRuntime.ts` | Optional absolute Chrome executable used when platform auto-detection is insufficient. |
+| `TELEGRAM_BOT_TOKEN` | _(unset)_ | `src/lib/telegram/config.ts` | BotFather token that enables the inbound webhook and signs Mini App `initData`. |
+| `TELEGRAM_DEFAULT_MODEL` | `auto/chat` | `src/lib/telegram/chatProxy.ts` | Model used for Telegram chat replies. |
+| `TELEGRAM_BOT_API_BASE` | `https://api.telegram.org` | `src/lib/telegram/config.ts` | Bot API base URL override for proxies or self-hosted Bot API servers. |
+| `TELEGRAM_WEBHOOK_TIMEOUT_MS` | `60000` | `src/lib/telegram/config.ts` | Timeout in milliseconds for outbound Bot API calls. |

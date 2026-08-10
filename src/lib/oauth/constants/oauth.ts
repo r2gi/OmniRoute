@@ -152,6 +152,19 @@ export const XAI_OAUTH_CONFIG = {
   callbackHost: "127.0.0.1",
 };
 
+// Openference OAuth Configuration (Authorization Code Flow with PKCE)
+export const OPENFERENCE_CONFIG = {
+  clientId: resolvePublicCred("openference_id"),
+  authorizeUrl: "https://openference.com/app/oauth/authorize",
+  tokenUrl: "https://openference.com/oauth/token",
+  userinfoUrl: "https://openference.com/oauth/userinfo",
+  scope: "openid profile email model:invoke offline_access",
+  codeChallengeMethod: "S256",
+  loopbackPort: 56123,
+  callbackPath: "/callback",
+  callbackHost: "127.0.0.1",
+};
+
 // Kimi Coding OAuth Configuration (Device Code Flow)
 export const KIMI_CODING_CONFIG = {
   clientId: resolvePublicCred("kimi_id", "KIMI_CODING_OAUTH_CLIENT_ID"),
@@ -531,6 +544,10 @@ export const PROVIDERS = {
   KIRO: "kiro",
   AMAZON_Q: "amazon-q",
   CURSOR: "cursor",
+  // #8895 — registered in src/lib/oauth/providers/index.ts but missing here, so
+  // every consumer reading PROVIDERS (onboarding wizard, test-connection routing)
+  // did not know Raycast Pro exists as an OAuth provider.
+  RAYCAST: "raycast",
   KILOCODE: "kilocode",
   CLINE: "cline",
   CLINEPASS: "clinepass",
@@ -540,6 +557,7 @@ export const PROVIDERS = {
   CODEBUDDY_CN: "codebuddy-cn",
   GROK_CLI: "grok-cli",
   XAI_OAUTH: "xai-oauth",
+  OPENFERENCE: "openference",
   ZED: "zed",
   ZED_HOSTED: "zed-hosted",
 };
