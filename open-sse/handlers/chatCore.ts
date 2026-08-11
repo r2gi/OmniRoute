@@ -266,7 +266,7 @@ import {
   normalizeExecutorResult,
   executeWithUpstreamStartTimeout,
 } from "./chatCore/upstreamTimeouts.ts";
-import { getModelNormalizeToolCallId, getModelPreserveOpenAIDeveloperRole } from "@/lib/localDb";
+import { getModelNormalizeToolCallId, getModelPreserveOpenAIDeveloperRole } from "@/lib/db/models";
 import { getProviderCredentials, extractSessionAffinityKey } from "@/sse/services/auth";
 import { deleteSessionAccountAffinity } from "@/lib/db/sessionAccountAffinity";
 import { getCacheControlSettings } from "@/lib/cacheControlSettings";
@@ -302,6 +302,7 @@ import {
   updateFromResponseBody,
   initializeRateLimits,
 } from "../services/rateLimitManager.ts";
+import * as localLimiterErrors from "../services/rateLimitManager/errors.ts";
 import {
   acquire as acquireAccountSemaphore,
   markBlocked as markAccountSemaphoreBlocked,
@@ -1037,6 +1038,13 @@ export async function handleChatCore({
 
   log?.debug?.("FORMAT", `${sourceFormat} → ${targetFormat} | stream=${stream}`);
 
+  // Preserve original body for cache signature — the body variable is mutated
+  // multiple times below (sanitization, memory/skills injection) before the
+  // cache store path runs at Phase 9.1 (non-streaming) / Phase 9.2 (streaming).
+  // Without this snapshot, the write-time signature differs from the read-time
+  // one, producing 0% hit rate. (#cache-signature-asymmetry)
+  const bodyForCacheWrite = body;
+
   // ── Phase 9.1: Semantic cache check (temp=0, any streaming mode) ──
   const cacheHit = await checkSemanticCache({
     semanticCacheEnabled,
@@ -1115,10 +1123,9 @@ export async function handleChatCore({
     const compressionSettings: CompressionConfig | null = compressionSettingsResult.settings;
     // #8034 — operator-named model/endpoint exclusions bypass the whole pipeline, exactly
     // like compression being globally disabled, so the body is provably byte-identical.
-    const compressionExcluded = isCompressionExcluded(
-      { provider, model: effectiveModel },
-      compressionSettings?.exclusions
-    );
+    const compressionExcluded =
+      nativeCodexPassthrough ||
+      isCompressionExcluded({ provider, model: effectiveModel }, compressionSettings?.exclusions);
     let promptCompressionEnabled = compressionSettingsResult.enabled && !compressionExcluded;
     reactiveContextCompactionEnabled = compressionSettingsResult.enabled && !compressionExcluded;
     contextEditingEnabled = compressionSettingsResult.contextEditingEnabled;
@@ -2976,6 +2983,8 @@ export async function handleChatCore({
                 const okStatus = res.response.status >= 200 && res.response.status < 300;
                 let streamRecoveryEnabled = false;
                 let continueMidStreamEnabled = false;
+                let throughputWatchdog =
+                  resolveResilienceSettings(null).streamRecovery.throughputWatchdog;
                 if (okStatus) {
                   try {
                     // Reuse the request-consolidated settings read (see line ~2076) — no
@@ -2990,6 +2999,7 @@ export async function handleChatCore({
                     const goalOverride = !operatorExplicit && agentGoalPolicy.streamRecoveryEnabled;
                     streamRecoveryEnabled = sr.enabled || goalOverride;
                     continueMidStreamEnabled = sr.continueMidStream === true;
+                    throughputWatchdog = sr.throughputWatchdog;
                     if (goalOverride && !sr.enabled) {
                       log?.info?.(
                         "AGENT_GOAL",
@@ -2999,11 +3009,13 @@ export async function handleChatCore({
                   } catch {
                     streamRecoveryEnabled = false;
                     continueMidStreamEnabled = false;
+                    throughputWatchdog =
+                      resolveResilienceSettings(null).streamRecovery.throughputWatchdog;
                   }
                 }
 
                 let clientBody: ReadableStream<Uint8Array>;
-                if (streamRecoveryEnabled) {
+                if (streamRecoveryEnabled || throughputWatchdog.enabled) {
                   // Run the SAME upstream (same account/creds) with a given body and return
                   // its 2xx stream, or null. Used both by the early-retry re-open (same body)
                   // and the mid-stream continuation (assistant-prefilled body).
@@ -3084,6 +3096,12 @@ export async function handleChatCore({
                         log?.warn?.(
                           "STREAM_RECOVERY",
                           `mid-stream continuation attempt ${attempt}/${STREAM_RECOVERY.EARLY_RETRY_MAX}`
+                        ),
+                      throughputWatchdog,
+                      onWatchdogAbort: () =>
+                        log?.warn?.(
+                          "STREAM_WATCHDOG",
+                          "active upstream stream stayed below the configured useful-output rate"
                         ),
                     }
                   );
@@ -3345,27 +3363,22 @@ export async function handleChatCore({
         errorCode: error.code,
       };
     }
-    // abort(reason) can reject the upstream fetch with a raw string reason
-    // (e.g. "request_signal_aborted") that has no `name`/`status`; classify
-    // via isLocalStreamLifecycleError so those map to 499 instead of falling
-    // through to the 502 provider-failure default.
+    // abort(reason) can reject with a raw string lacking `name`/`status`; classify
+    // it through isLocalStreamLifecycleError so it maps to 499 rather than the
+    // 502 provider-failure default.
     const isRequestAborted = isLocalStreamLifecycleError(error);
-    // #8376: an unreachable upstream proxy (ECONNREFUSED/ECONNRESET/...) is tagged by
-    // proxyFetch.ts (tagProxyUnreachable) with `.errorCode = "proxy_unreachable"` before
-    // it reaches this catch. Classify it explicitly to 502 instead of falling through
-    // the generic `error.status` branch (a raw connect-refused error has no `.status` at
-    // all, so it used to collapse into an ordinary 502/504 the provider-breaker predicate
-    // can't tell apart from a per-model 5xx).
+    // #8376: proxyFetch tags unreachable transport failures so they remain
+    // distinguishable from ordinary provider 5xx responses.
     const isProxyUnreachableFailure =
       !isRequestAborted && (error as { errorCode?: unknown })?.errorCode === "proxy_unreachable";
     const errorCode = getUpstreamErrorIdentifier(error);
-    const isLocalQueueTimeout = errorCode === "RATE_LIMIT_QUEUE_TIMEOUT";
+    const localRateLimitFailure = localLimiterErrors.getClientSafeLocalRateLimitError(error);
     const failureStatus = isRequestAborted
       ? 499
       : isProxyUnreachableFailure
         ? HTTP_STATUS.BAD_GATEWAY
-        : isLocalQueueTimeout
-          ? HTTP_STATUS.SERVICE_UNAVAILABLE
+        : localRateLimitFailure
+          ? localRateLimitFailure.status
           : error.name === "TimeoutError" || error.name === "BodyTimeoutError"
             ? HTTP_STATUS.GATEWAY_TIMEOUT
             : error.status && typeof error.status === "number"
@@ -3373,8 +3386,9 @@ export async function handleChatCore({
               : HTTP_STATUS.BAD_GATEWAY;
     const failureMessage = isRequestAborted
       ? "Request aborted"
-      : formatProviderError(error, provider, model, failureStatus);
-    const upstreamErrorCode = isProxyUnreachableFailure ? "proxy_unreachable" : errorCode;
+      : formatProviderError(localRateLimitFailure ?? error, provider, model, failureStatus);
+    const upstreamErrorCode =
+      localRateLimitFailure?.code ?? (isProxyUnreachableFailure ? "proxy_unreachable" : errorCode);
     // Tag our own deadline timeouts (fetch-start TimeoutError / body BodyTimeoutError,
     // both surfaced as a 504) as "upstream_timeout" so the cooldown layer can tell a
     // slow-but-not-failed request apart from a real provider 5xx. (Antigravity already
@@ -3424,19 +3438,22 @@ export async function handleChatCore({
         upstreamErrorCode,
         upstreamErrorType
       );
+      localLimiterErrors.markTrustedLocalRateLimitResponse(result.response, error);
       return {
         ...result,
         errorType: upstreamErrorType,
         errorCode: upstreamErrorCode,
       };
     }
-    return createErrorResult(
+    const result = createErrorResult(
       failureStatus,
       failureMessage,
       null,
       upstreamErrorCode,
       upstreamErrorType
     );
+    localLimiterErrors.markTrustedLocalRateLimitResponse(result.response, error);
+    return result;
   }
   let upstreamErrorParsed = false;
   let parsedStatusCode = providerResponse.status;
@@ -4557,7 +4574,7 @@ export async function handleChatCore({
     // ── Phase 9.1: Cache store (non-streaming, temp=0) ──
     storeSemanticCacheResponse({
       enabled: semanticCacheEnabled,
-      body,
+      body: bodyForCacheWrite,
       headers: clientRawRequest?.headers,
       translatedResponse,
       model,
@@ -4911,7 +4928,7 @@ export async function handleChatCore({
       enabled: semanticCacheEnabled,
       streamStatus,
       streamResponseBody,
-      body,
+      body: bodyForCacheWrite,
       headers: clientRawRequest?.headers,
       model,
       apiKeyId: apiKeyInfo?.id ?? undefined,
