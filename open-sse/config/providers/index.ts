@@ -14,6 +14,7 @@ import { notion_webProvider } from "./registry/notion-web/index.ts";
 import { anthropicProvider } from "./registry/anthropic/index.ts";
 import { sambanovaProvider } from "./registry/sambanova/index.ts";
 import { puterProvider } from "./registry/puter/index.ts";
+import { deepaiProvider } from "./registry/deepai/index.ts";
 import { upstageProvider } from "./registry/upstage/index.ts";
 import { nebiusProvider } from "./registry/nebius/index.ts";
 import { fireworksProvider } from "./registry/fireworks/index.ts";
@@ -227,6 +228,7 @@ import { digitaloceanProvider } from "./registry/digitalocean/index.ts";
 import { hcnsecProvider } from "./registry/hcnsec/index.ts";
 import { promptqlProvider } from "./registry/promptql/index.ts";
 import { hyperagentProvider } from "./registry/hyperagent/index.ts";
+import { muse_codeProvider } from "./registry/muse-code/index.ts";
 
 export const REGISTRY: Record<string, RegistryEntry> = {
   aimlapi: aimlapiProvider,
@@ -241,6 +243,7 @@ export const REGISTRY: Record<string, RegistryEntry> = {
   sambanova: sambanovaProvider,
   puter: puterProvider,
   upstage: upstageProvider,
+  deepai: deepaiProvider,
   nebius: nebiusProvider,
   fireworks: fireworksProvider,
   llamagate: llamagateProvider,
@@ -455,5 +458,6 @@ export const REGISTRY: Record<string, RegistryEntry> = {
   hcnsec: hcnsecProvider,
   promptql: promptqlProvider,
   hyperagent: hyperagentProvider,
+  "muse-code": muse_codeProvider,
   unorouter: unorouterProvider,
 };
