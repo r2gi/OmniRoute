@@ -74,6 +74,60 @@ function normalizeZedProvider(value: unknown, model: unknown): ZedProviderName {
   return ZED_PROVIDER.openai;
 }
 
+/**
+ * Force an explicit `is_error` onto every Anthropic `tool_result` block.
+ *
+ * cloud.zed.dev parses `provider_request` for the Anthropic family with a Rust
+ * struct whose `is_error` is NOT `Option<bool>`, so a block that omits the field
+ * fails the whole request with
+ *
+ *   400 [400]: failed to parse Anthropic request: missing field `is_error`
+ *
+ * The Anthropic Messages API makes `is_error` optional and openaiToClaudeRequest
+ * follows the spec — the `role: "tool"` branch never emits it and the
+ * user-content branch emits it only when truthy — so every tool-using
+ * conversation dies on the turn that hands the first tool_result back. Observed
+ * live in call_logs: zed-hosted/claude-sonnet-5 is 200 for a plain completion
+ * and 200 on the turn the model emits a tool_use, then 400 on the very next
+ * turn carrying the tool_result (reproduced twice); the same client and request
+ * shape against openrouter/* and opencode/* completes the loop with 200s.
+ *
+ * Normalizing here rather than in openaiToClaudeRequest keeps the spec-correct
+ * omission for every genuine Anthropic endpoint and confines the shim to the
+ * provider that needs it — the same containment as ZED_PROVIDER above.
+ *
+ * `is_error: true` is preserved; only a missing/non-boolean field is defaulted
+ * to `false`. Rebuilt rather than mutated so nothing already handed to the
+ * caller is edited underneath it, and untouched requests keep their identity.
+ */
+function withZedToolResultIsError(request: unknown): unknown {
+  const messages = (request as { messages?: unknown } | null)?.messages;
+  if (!Array.isArray(messages)) return request;
+
+  let requestChanged = false;
+  const patchedMessages = messages.map((message) => {
+    const content = (message as { content?: unknown } | null)?.content;
+    // String content carries no blocks, so there is nothing to normalize.
+    if (!Array.isArray(content)) return message;
+
+    let messageChanged = false;
+    const patchedContent = content.map((block) => {
+      const candidate = block as { type?: unknown; is_error?: unknown } | null;
+      if (candidate?.type !== "tool_result") return block;
+      if (typeof candidate.is_error === "boolean") return block;
+      messageChanged = true;
+      return { ...candidate, is_error: Boolean(candidate.is_error) };
+    });
+
+    if (!messageChanged) return message;
+    requestChanged = true;
+    return { ...(message as Record<string, unknown>), content: patchedContent };
+  });
+
+  if (!requestChanged) return request;
+  return { ...(request as Record<string, unknown>), messages: patchedMessages };
+}
+
 function buildProviderRequest(
   provider: ZedProviderName,
   model: string,
@@ -82,7 +136,7 @@ function buildProviderRequest(
   credentials: ProviderCredentials
 ): unknown {
   if (provider === ZED_PROVIDER.anthropic) {
-    return openaiToClaudeRequest(model, body, true);
+    return withZedToolResultIsError(openaiToClaudeRequest(model, body, true));
   }
   if (provider === ZED_PROVIDER.google) {
     return openaiToGeminiRequest(model, body as Record<string, unknown>, true, credentials);
@@ -423,6 +477,8 @@ export default ZedHostedExecutor;
 
 export const __test__ = {
   normalizeZedProvider,
+  withZedToolResultIsError,
+  buildProviderRequest,
   unwrapZedLine,
   wrapZedCompletionStream,
 };
