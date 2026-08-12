@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import { REGISTRY } from "../../open-sse/config/providers/index.ts";
 import { getExecutor, hasSpecializedExecutor } from "../../open-sse/executors/index.ts";
 import { ZedHostedExecutor, __test__ } from "../../open-sse/executors/zed-hosted.ts";
+import { openaiToClaudeRequest } from "../../open-sse/translator/request/openai-to-claude.ts";
 import type { ExecutorLog } from "../../open-sse/executors/base.ts";
 import {
   createZedNativeAuthData,
@@ -19,7 +20,8 @@ import {
   type ZedCredentials,
 } from "../../open-sse/shared/zedAuth.ts";
 
-const { normalizeZedProvider, unwrapZedLine } = __test__;
+const { normalizeZedProvider, withZedToolResultIsError, buildProviderRequest, unwrapZedLine } =
+  __test__;
 
 // ─── Registry ──────────────────────────────────────────────────────────────
 
@@ -311,6 +313,243 @@ describe("normalizeZedProvider", () => {
       const out = normalizeZedProvider(raw, model);
       assert.equal(out, out.toLowerCase(), `${String(raw)}/${model} produced "${out}"`);
     }
+  });
+});
+
+// ─── Executor: Anthropic tool_result `is_error` normalization ───────────────
+
+describe("withZedToolResultIsError", () => {
+  // cloud.zed.dev parses the Anthropic provider_request with a Rust struct whose
+  // `is_error` is not Option<bool>. Omitting it — which the Anthropic spec allows
+  // and openaiToClaudeRequest does — fails the request with
+  //   400 [400]: failed to parse Anthropic request: missing field `is_error`
+  // on the first turn that carries a tool_result back, while the preceding
+  // tool_use turn 200s.
+
+  function toolResultBlocks(request: unknown): { type?: unknown; is_error?: unknown }[] {
+    const messages = (request as { messages?: unknown[] }).messages ?? [];
+    return messages
+      .flatMap((m) => {
+        const content = (m as { content?: unknown }).content;
+        return Array.isArray(content) ? content : [];
+      })
+      .filter((b) => (b as { type?: unknown })?.type === "tool_result") as {
+      type?: unknown;
+      is_error?: unknown;
+    }[];
+  }
+
+  test("injects is_error:false when the block omits it", () => {
+    const patched = withZedToolResultIsError({
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "42" }],
+        },
+      ],
+    });
+    const blocks = toolResultBlocks(patched);
+    assert.equal(blocks.length, 1);
+    assert.equal(blocks[0].is_error, false, "missing is_error must become an explicit false");
+    assert.ok("is_error" in blocks[0], "the field must be present, not merely falsy");
+  });
+
+  test("preserves is_error:true", () => {
+    const patched = withZedToolResultIsError({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_1", content: "boom", is_error: true },
+          ],
+        },
+      ],
+    });
+    assert.equal(toolResultBlocks(patched)[0].is_error, true);
+  });
+
+  test("leaves an explicit is_error:false alone", () => {
+    const patched = withZedToolResultIsError({
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "tool_result", tool_use_id: "t", content: "ok", is_error: false }],
+        },
+      ],
+    });
+    assert.equal(toolResultBlocks(patched)[0].is_error, false);
+  });
+
+  test("never touches non-tool_result blocks", () => {
+    const request = {
+      model: "claude-sonnet-5",
+      system: "be brief",
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "hi" },
+            { type: "tool_use", id: "toolu_1", name: "ls", input: {} },
+            { type: "thinking", thinking: "hmm" },
+          ],
+        },
+        { role: "user", content: "plain string content" },
+      ],
+    };
+    const patched = withZedToolResultIsError(request) as typeof request;
+    // No tool_result anywhere → the request comes back untouched, identity included.
+    assert.equal(patched, request);
+    assert.deepEqual(patched, request);
+    for (const block of patched.messages[0].content as Record<string, unknown>[]) {
+      assert.ok(!("is_error" in block), `is_error leaked onto a ${String(block.type)} block`);
+    }
+  });
+
+  test("normalizes only the tool_result blocks in a mixed content array", () => {
+    const patched = withZedToolResultIsError({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "a", content: "ok" },
+            { type: "text", text: "and now this" },
+            { type: "tool_result", tool_use_id: "b", content: "bad", is_error: true },
+          ],
+        },
+      ],
+    }) as { messages: { content: Record<string, unknown>[] }[] };
+    const content = patched.messages[0].content;
+    assert.equal(content[0].is_error, false);
+    assert.ok(!("is_error" in content[1]), "the text block must stay untouched");
+    assert.equal(content[1].text, "and now this");
+    assert.equal(content[2].is_error, true);
+  });
+
+  test("does not mutate the request it was handed", () => {
+    const block = { type: "tool_result", tool_use_id: "toolu_1", content: "42" };
+    const message = { role: "user", content: [block] };
+    const request = { messages: [message] };
+
+    const patched = withZedToolResultIsError(request);
+
+    assert.notEqual(patched, request, "a changed request must be a fresh object");
+    assert.ok(!("is_error" in block), "the caller's block must be left alone");
+    assert.equal(request.messages[0], message);
+    assert.equal(message.content[0], block);
+  });
+
+  test("passes through inputs that carry no messages array", () => {
+    for (const input of [null, undefined, {}, { messages: "nope" }, { messages: null }]) {
+      assert.equal(withZedToolResultIsError(input), input);
+    }
+  });
+
+  test("covers the tool_result blocks openaiToClaudeRequest actually emits", () => {
+    // The real regression path: a Hermes-style tool loop arrives as OpenAI
+    // messages, and openaiToClaudeRequest rebuilds Anthropic tool_result blocks
+    // WITHOUT is_error — from `role: "tool"` (never emits it) and from an
+    // Anthropic-shaped user block (emits it only when truthy).
+    // Both results must be paired with a real tool_use — enforceToolResultAdjacency
+    // drops true orphans, so an unpaired block would never reach the shim.
+    const openaiBody = {
+      messages: [
+        { role: "user", content: "list the files" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            { id: "toolu_1", type: "function", function: { name: "ls", arguments: "{}" } },
+          ],
+        },
+        { role: "tool", tool_call_id: "toolu_1", content: "a.txt\nb.txt" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "toolu_2",
+              type: "function",
+              function: { name: "cat", arguments: '{"path":"a.txt"}' },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "toolu_2", content: "boom", is_error: true },
+          ],
+        },
+      ],
+    };
+
+    const claudeRequest = openaiToClaudeRequest("claude-sonnet-5", openaiBody, true);
+    const before = toolResultBlocks(claudeRequest);
+    assert.ok(before.length >= 2, "translator must produce the tool_result blocks under test");
+    assert.ok(
+      before.some((b) => !("is_error" in b)),
+      "guard: the translator must still be omitting is_error, or this shim is obsolete"
+    );
+
+    const after = toolResultBlocks(withZedToolResultIsError(claudeRequest));
+    assert.equal(after.length, before.length);
+    for (const b of after) {
+      assert.equal(typeof b.is_error, "boolean", "every tool_result must carry a boolean is_error");
+    }
+    assert.ok(
+      after.some((b) => b.is_error === true),
+      "the is_error:true block must survive normalization"
+    );
+    assert.ok(after.some((b) => b.is_error === false));
+  });
+});
+
+describe("buildProviderRequest tool_result normalization", () => {
+  const toolLoopBody = {
+    messages: [
+      { role: "user", content: "list the files" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "toolu_1", type: "function", function: { name: "ls", arguments: "{}" } },
+        ],
+      },
+      { role: "tool", tool_call_id: "toolu_1", content: "a.txt" },
+    ],
+  };
+
+  test("the anthropic branch emits an explicit is_error on every tool_result", () => {
+    const request = buildProviderRequest(
+      "anthropic",
+      "claude-sonnet-5",
+      toolLoopBody,
+      true,
+      {}
+    ) as { messages: { content: unknown }[] };
+
+    const blocks = request.messages
+      .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+      .filter((b) => (b as { type?: unknown })?.type === "tool_result");
+
+    assert.ok(blocks.length > 0, "the tool loop must survive into the Anthropic request");
+    for (const block of blocks) {
+      assert.equal(
+        typeof (block as { is_error?: unknown }).is_error,
+        "boolean",
+        "cloud.zed.dev 400s on a tool_result whose is_error is missing"
+      );
+    }
+  });
+
+  test("the xai passthrough branch is left alone — the shim is Anthropic-only", () => {
+    // x_ai forwards the OpenAI-shaped body verbatim; nothing should gain is_error.
+    const request = buildProviderRequest("x_ai", "grok-4", toolLoopBody, true, {}) as {
+      messages: Record<string, unknown>[];
+    };
+    for (const message of request.messages) {
+      assert.ok(!("is_error" in message), "is_error must not leak into a non-Anthropic body");
+    }
+    assert.deepEqual(request.messages, toolLoopBody.messages);
   });
 });
 
